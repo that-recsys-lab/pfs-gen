@@ -1,5 +1,5 @@
 import pandas as pd
-from scipy.sparse import dok_matrix
+from scipy.sparse import dok_matrix, csc_matrix
 
 
 def to_map(xs):
@@ -10,7 +10,7 @@ def to_map(xs):
 
 # Movielens ML-20M is expected to be extracted in ./ml-20m/
 def load_movielens_ratings():
-    ratings = pd.read_csv("ml-20m/ratings.csv")
+    ratings = pd.read_csv("ml-latest-small/ratings.csv")
 
     # Map users/items into a more dense structure, as
     # not all movies have ratings
@@ -19,7 +19,11 @@ def load_movielens_ratings():
 
     rating_matrix = dok_matrix((len(user_to_id), len(item_to_id)))
     for u, i, r in ratings[["userId", "movieId", "rating"]].values:
-        rating_matrix[user_to_id[u], item_to_id[i]] = r / 5.0
+        rating_matrix[user_to_id[u], item_to_id[i]] = r
+
+    # That's the only sane way to preserve explicit zeroes
+    rating_matrix = csc_matrix(rating_matrix)
+    rating_matrix.data = rating_matrix.data / 2.5 - 1.0
 
     return rating_matrix, id_to_user, id_to_item
 

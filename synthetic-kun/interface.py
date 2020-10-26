@@ -17,9 +17,8 @@ class SyntheticDataGenerator:
 
 
 class MFDataGenerator(SyntheticDataGenerator):
-    def __init__(self, ratings):
+    def __init__(self, ratings, verbose=True):
         super().__init__(ratings)
-        self.ratings = csc_matrix(self.ratings)
         self.n_users = self.ratings.shape[0]
         self.n_items = self.ratings.shape[1]
         self.user_vectors = None
@@ -28,6 +27,7 @@ class MFDataGenerator(SyntheticDataGenerator):
         self.item_proba_vectors = None
         self.item_proba_intercepts = None
         self.consider_items = None
+        self.verbose = verbose
 
     def _build_mf(self, components):
         u, s, v = sparsesvd(self.ratings, components)
@@ -44,15 +44,23 @@ class MFDataGenerator(SyntheticDataGenerator):
         item_proba_intercepts = []
 
         for i in range(consider_items):
-            item_ratings = (self.ratings[:, i] > 0).todense() * 1.0
-            item_ratings = np.squeeze(item_ratings.__array__())
-            weights = self.n_items * item_ratings / item_ratings.sum() + 1.0
+            if self.verbose and (i % 100 == 0):
+                print(i)
+            try:
+                item_rating_indices = self.ratings.indices[self.ratings.indptr[i]: self.ratings.indptr[i + 1]]
+                item_ratings = np.zeros(self.n_users)
+                item_ratings[item_rating_indices] = 1.0
 
-            m = LogisticRegression(max_iter=2000)
-            m.fit(self.user_vectors, item_ratings, weights)
+                weights = self.n_items * item_ratings / item_ratings.sum() + 1.0
 
-            item_proba_vectors.append(m.coef_)
-            item_proba_intercepts.append(m.intercept_)
+                m = LogisticRegression(max_iter=2000)
+                m.fit(self.user_vectors, item_ratings, weights)
+
+                item_proba_vectors.append(m.coef_)
+                item_proba_intercepts.append(m.intercept_)
+            except Exception as e:
+                print(i)
+                raise e
 
         self.item_proba_vectors = np.array(item_proba_vectors)[:, 0, :]
         self.item_proba_intercepts = np.array(item_proba_intercepts)[:, 0]
@@ -90,7 +98,7 @@ class MFDataGenerator(SyntheticDataGenerator):
 
             sampled_items = np.random.choice(ids, ratings_count, False, p=logits)
             sampled_rating = self.item_vectors[sampled_items].dot(v)
-            sampled_rating = np.minimum(1.0, np.maximum(sampled_rating, 0.0))
+            sampled_rating = np.minimum(1.0, np.maximum(sampled_rating, -1.0))
 
             for i, r in zip(sampled_items, sampled_rating):
                 rating_matrix[u, i] = r
