@@ -101,21 +101,25 @@ class MFDataGenerator(SyntheticDataGenerator):
         sampled_rating = user_vector.dot(self.item_vectors[item])
         return sampled_rating
 
-    def generate(self, n_users, use_actual_user_vectors=False):
+    def generate(self, n_users, use_actual_user_vectors=False, use_actual_items=False):
         user_vectors, ratings_per_user = self._sample_users(n_users)
 
-        rating_matrix = dok_matrix((n_users, self.consider_items))
+        n_items = self.item_vectors.shape[0]
+        rating_matrix = dok_matrix((n_users, n_items))
 
         for u in range(n_users):
             ratings_count = int(ratings_per_user[u])
-            ratings_count = min(ratings_count, self.consider_items)
+            ratings_count = min(ratings_count, n_items)
 
             if use_actual_user_vectors:
-                v = user_vectors[u, :]
+                v = self.user_vectors[u, :]
             else:
                 v = user_vectors[u, :]
 
-            sampled_items = self._sample_user_items(v, ratings_count)
+            if use_actual_items:
+                sampled_items = self._sample_user_items(v, ratings_count)
+            else:
+                sampled_items = self._sample_user_items(v, ratings_count)
 
             for i in sampled_items:
                 rating_matrix[u, i] = self._get_user_rating(v, i)
