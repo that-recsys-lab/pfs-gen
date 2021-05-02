@@ -1,3 +1,4 @@
+from clearml import Task
 from scipy.sparse import csc_matrix, dok_matrix
 from sklearn.linear_model import LogisticRegression
 from sklearn.multiclass import OneVsRestClassifier
@@ -5,16 +6,17 @@ from sparsesvd import sparsesvd
 import numpy as np
 from sklearn.mixture import GaussianMixture
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 
 class SyntheticDataGenerator:
     def __init__(self, ratings):
         self.ratings = ratings
 
-    def build(self):
+    def build(self, task: Task, **kwargs):
         raise NotImplementedError()
 
-    def generate(self, n_users):
+    def generate(self, task, n_users=None, **kwargs):
         raise NotImplementedError()
 
 
@@ -70,7 +72,7 @@ class MFDataGenerator(SyntheticDataGenerator):
         self.item_proba_vectors = np.array(item_proba_vectors)[:, 0, :]
         self.item_proba_intercepts = np.array(item_proba_intercepts)[:, 0]
 
-    def build(self, components=200, gmm_clusters=10, consider_items=3000):
+    def build(self, task: Task, components=200, gmm_clusters=10, consider_items=3000, **kwargs):
         self.consider_items = consider_items
 
         self._build_mf(components)
@@ -88,8 +90,8 @@ class MFDataGenerator(SyntheticDataGenerator):
 
         return user_vectors, ratings_per_user
 
-    def _sample_user_items(self, user_vector, n_items):
-        dotproducts = np.dot(self.item_proba_vectors, user_vector) + self.item_proba_intercepts
+    def _sample_user_items(self, dotproducts, n_items):
+        # dotproducts = np.dot(self.item_proba_vectors, user_vector) + self.item_proba_intercepts
         logits = 1.0 / (1e-7 + np.exp(-dotproducts))
         logits = logits / np.sum(logits)
 
@@ -101,28 +103,34 @@ class MFDataGenerator(SyntheticDataGenerator):
         sampled_rating = user_vector.dot(self.item_vectors[item])
         return sampled_rating
 
-    def generate(self, n_users, use_actual_user_vectors=False, use_actual_items=False):
+    def generate(self, task, n_users=None, use_actual_user_vectors=False, use_actual_items=False, **kwargs):
+        if n_users is None:
+            n_users = self.ratings.shape[0]
+
         user_vectors, ratings_per_user = self._sample_users(n_users)
 
         n_items = self.item_vectors.shape[0]
         rating_matrix = dok_matrix((n_users, n_items))
 
-        for u in range(n_users):
-            ratings_count = int(ratings_per_user[u])
-            ratings_count = min(ratings_count, n_items)
+        batches = max(1, int(n_users / 1000))
+        for batch_n, user_vectors_batch in enumerate(tqdm(np.array_split(user_vectors, batches))):
+            user_index_base = batch_n * 1000
 
-            if use_actual_user_vectors:
+            # Super-efficient batched matrix multiplication that exploits pytorch (=GPU)
+            probas = self.model.user_choice_probas(user_vectors_batch)
+
+            for user_index_offset in range(len(probas)):
+                u = user_index_base + user_index_offset
+
+                ratings_count = int(ratings_per_user[u])
+                ratings_count = min(ratings_count, n_items)
+
                 v = self.user_vectors[u, :]
-            else:
-                v = user_vectors[u, :]
 
-            if use_actual_items:
-                sampled_items = self._sample_user_items(v, ratings_count)
-            else:
-                sampled_items = self._sample_user_items(v, ratings_count)
+                sampled_items = self._sample_user_items(probas[user_index_offset, :], ratings_count)
 
-            for i in sampled_items:
-                rating_matrix[u, i] = self._get_user_rating(v, i)
-                rating_matrix[u, i] = np.minimum(1.0, np.maximum(rating_matrix[u, i], -1.0))
+                for i in sampled_items:
+                    rating_matrix[u, i] = self._get_user_rating(v, i)
+                    rating_matrix[u, i] = np.minimum(1.0, np.maximum(rating_matrix[u, i], -1.0))
 
         return rating_matrix
