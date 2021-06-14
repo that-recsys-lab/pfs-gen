@@ -10,6 +10,7 @@ import subprocess
 
 import pandas as pd
 
+import datasets
 from tools import to_clear_ml_params
 
 config_template = """<?xml version="1.0"?>
@@ -67,13 +68,13 @@ LOG_FILE = "post/study-results-summary_*.csv"
 
 
 def run_librec_auto_experiment(task, dataset_path, recommender, params):
-    task.set_user_properties(**to_clear_ml_params(params))
-
     if not os.path.exists("post"):
         os.makedirs("post")
 
     if not os.path.exists("conf"):
         os.makedirs("conf")
+
+    task.set_user_properties(**to_clear_ml_params(params))
 
     copyfile(dataset_path, DATASET_PATH)
     param_str = "\n".join(["<{0}>{1}</{0}>".format(k, v) for k, v in params.items()])
@@ -101,10 +102,12 @@ def run_librec_auto_experiment(task, dataset_path, recommender, params):
         for c in b.columns:
             if c != "Experiment":
                 task.logger.report_scalar(c, "Value", b[c][0], 0)
-        print(b)
 
 
 def main(task, dataset_task_id, recommender, extra):
+    if dataset_task_id in datasets.name_to_class:
+        pass
+
     gen_task = Task.get_task(task_id=dataset_task_id)
     dataset_path = gen_task.artifacts["dataset"].get_local_copy()
     run_librec_auto_experiment(task, dataset_path, recommender, extra)

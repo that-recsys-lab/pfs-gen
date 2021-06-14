@@ -1,9 +1,29 @@
 import argparse
 import json
 import pickle
+import matplotlib.pyplot as plt
 
 from clearml import Task
+
+from datasets import Dataset
 from generators import SyntheticDataGenerator
+
+
+import matplotlib.pyplot as plt
+
+
+def log_it(t: Task, key, value):
+    if isinstance(value, int) or isinstance(value, float):
+        t.logger.report_scalar(key, None, value, None)
+    elif isinstance(value, plt.Figure):
+        t.logger.report_matplotlib_figure(key, None, None, value)
+
+
+def log_dataset_metrics(task: Task, ds: Dataset):
+    stats = ds.print_stats()
+    for k, v in stats:
+        log_it(task, k, v)
+    task.flush()
 
 
 def main(task, generator_task_id, extra):

@@ -16,7 +16,7 @@ class SyntheticDataGenerator:
     def build(self, task: Task, **kwargs):
         raise NotImplementedError()
 
-    def generate(self, task, n_users=None, **kwargs):
+    def generate(self, task: Task, n_users=None, **kwargs):
         raise NotImplementedError()
 
 

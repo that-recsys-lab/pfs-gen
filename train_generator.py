@@ -37,7 +37,7 @@ if __name__ == "__main__":
         tags.append("Final")
 
     task = Task.init(project_name="Synthetic data generators", task_name="train_generator", tags=tags,
-                     reuse_last_task_id=False)
+                     reuse_last_task_id=not args.final)
 
     main(task, args.dataset, args.generator, extra_args)
 
