@@ -1,12 +1,17 @@
-import torch
+from random import shuffle
+from typing import Type
+
 from clearml import Task
-from scipy.sparse import dok_matrix
+from scipy.sparse import dok_matrix, csc_matrix
 from sparsesvd import sparsesvd
 import numpy as np
 from sklearn.mixture import GaussianMixture
+from torch import Tensor, FloatTensor, LongTensor
+from tqdm import tqdm
 
+from datasets import Dataset
 from tools import to_clear_ml_params
-from .interface import MFDataGenerator
+from .interface import SyntheticDataGenerator
 import torch.nn
 
 
@@ -19,83 +24,112 @@ class MatrixFactorization(torch.nn.Module):
 
     def forward(self, user, item):
         predicted_ratings = (self.user_factors(user) * self.item_factors(item)).sum(2)
-        predicted_probas = (self.user_factors(user) * self.item_implicit_factors(item)).sum(2)
-        return predicted_ratings, predicted_probas
+        predicted_logits = (self.user_factors(user) * self.item_implicit_factors(item)).sum(2)
+        return predicted_ratings, predicted_logits
 
     def user_choice_probas(self, v):
-        formula = torch.Tensor(v).matmul(self.item_implicit_factors.weight.transpose(0, 1))
+        formula = Tensor(v).matmul(self.item_implicit_factors.weight.transpose(0, 1))
 
         return formula.detach().numpy()
 
 
-class TorchDataGenerator(MFDataGenerator):
-    def __init__(self, ratings, verbose=True):
-        super().__init__(ratings, verbose)
+class TorchDataGenerator(SyntheticDataGenerator):
+    def __init__(self, verbose=True):
         self._implicit_coef = None
         self.model = None
+        self.verbose = verbose
 
-    def _build_mf(self, components):
-        u, s, v = sparsesvd(self.ratings, components)
+        self.items_view = None
+        self.avg_ratings_per_user = None
+
+        self.item_ids = None
+        self.user_vectors = None
+        self.item_vectors = None
+        self.gmm = None
+
+    def _build_mf(self, ds: Dataset, task: Task, components):
+        task.logger.report_text("Training MF")
+        u, s, v = sparsesvd(ds.rating_matrix, components)
 
         self.user_vectors = u.T
         self.item_vectors = np.dot(np.diag(s), v).T
 
-    def _build_torch_model(self, components):
-        model = MatrixFactorization(self.n_users, self.n_items, components)
+    def _build_torch_model(self, ds: Dataset, task: Task, components):
+        task.logger.report_text("Building torch model")
+
+        model = MatrixFactorization(ds.n_users, ds.n_items, components)
         model.user_factors = torch.nn.Embedding(
-            self.n_users, components, _weight=torch.FloatTensor(self.user_vectors)
+            ds.n_users, components, _weight=FloatTensor(self.user_vectors)
         )
         model.item_factors = torch.nn.Embedding(
-            self.n_items, components, _weight=torch.FloatTensor(self.item_vectors)
+            ds.n_items, components, _weight=FloatTensor(self.item_vectors)
         )
         self.model = model
 
-    def _train_torch_model(self, epochs, logloss_weight, lr, implicit_logloss):
+    def _sample_unrated_items(self, ds: Dataset, batch_u, batch_i, batch_r):
+        return [np.random.randint(0, ds.n_items) for _ in range(len(batch_u))]
+
+    def _construct_loss(
+            self,
+            ds: Dataset,
+            batch_r, batch_u, batch_i,
+            logloss_weight,
+            return_loss_components
+    ):
+        gt_rating = FloatTensor([batch_r])
+        u_tensor = LongTensor([batch_u])
+        i_tensor = LongTensor([batch_i])
+
+        batch_unrated_items = self._sample_unrated_items(ds, batch_u, batch_i, batch_r)
+        batch_unrated_items_tensor = LongTensor(batch_unrated_items)
+
+        rated_prediction, rated_items_logits = self.model(u_tensor, i_tensor)
+        unrated_prediction, unrated_items_logits = self.model(u_tensor, batch_unrated_items_tensor)
+
+        ones_tensor = torch.ones_like(rated_items_logits)
+        zeroes_tensor = torch.zeros_like(unrated_items_logits)
+
+        proba_loss = (
+                ((rated_items_logits - ones_tensor) ** 2).mean() / 2 +
+                ((unrated_items_logits - zeroes_tensor) ** 2).mean() / 2
+        )
+        rating_loss = ((gt_rating - rated_prediction) * (gt_rating - rated_prediction)).mean()
+        loss = rating_loss + proba_loss * logloss_weight
+
+        loss_components = {}
+        if return_loss_components:
+            loss_components = {
+                "proba": proba_loss.item(),
+                "rating": rating_loss.item(),
+                "total": loss.item(),
+            }
+        return loss, loss_components
+
+    def _train_torch_model(self, ds: Dataset, task: Task, epochs, logloss_weight, lr, batch_size):
+        task.logger.report_text("Training torch model")
+
         optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
 
-        m2 = dok_matrix(self.ratings)
-
-        lsum, lsum2, lsum3 = [], [], []
+        loss_components_list = []
         batch_u, batch_i, batch_r = [], [], []
-        crossentropy = torch.nn.BCELoss()
+
+        if self.items_view is None:
+            m2 = dok_matrix(ds.rating_matrix)
+            self.items_view = list(m2.items())
 
         for e in range(epochs):
-            for j, ((u, i), r) in enumerate(m2.items()):
-                if (j > 0) and ((j % 5000 == 0) or (j == len(m2.items()))):
+            shuffle(self.items_view)
+            for j, ((u, i), r) in enumerate(tqdm(self.items_view)):
+                if (len(batch_u) > 0) and (j % batch_size == 0):  # or j == len(m2.items())):
                     optimizer.zero_grad()
 
-                    rating = torch.FloatTensor([batch_r])
-                    u_tensor = torch.LongTensor([batch_u])
-                    i_tensor = torch.LongTensor([batch_i])
-                    ones_tensor = torch.FloatTensor([[1.0] * len(batch_i)])
+                    loss, loss_components = self._construct_loss(
+                        ds, batch_r, batch_u, batch_i,
+                        logloss_weight,
+                        self.verbose
+                    )
 
-                    batch_unrated_items = [np.random.randint(0, self.n_items) for _ in range(len(batch_u))]
-                    batch_unrated_items_tensor = torch.LongTensor(batch_unrated_items)
-                    zeroes_tensor = torch.FloatTensor([[0.0] * len(batch_i)])
-
-                    predicted_ratings, rated_items_proba = self.model(u_tensor, i_tensor)
-                    _, unrated_items_proba = self.model(u_tensor, batch_unrated_items_tensor)
-
-                    if implicit_logloss:
-                        rated_items_proba = torch.sigmoid(rated_items_proba)
-                        unrated_items_proba = torch.sigmoid(unrated_items_proba)
-
-                        proba_loss = (
-                                crossentropy(rated_items_proba, ones_tensor) / 2 +
-                                crossentropy(unrated_items_proba, zeroes_tensor) / 2
-                        )
-                    else:
-                        proba_loss = (
-                                ((rated_items_proba - ones_tensor) ** 2).mean() / 2 +
-                                ((unrated_items_proba - zeroes_tensor) ** 2).mean() / 2
-                        )
-                    rating_loss = ((rating - predicted_ratings) * (rating - predicted_ratings)).mean()
-
-                    loss = rating_loss + proba_loss * logloss_weight
-
-                    lsum.append(proba_loss.item())
-                    lsum2.append(rating_loss.item())
-                    lsum3.append(loss.item())
+                    loss_components_list.append(loss_components)
 
                     loss.backward()
                     optimizer.step()
@@ -107,37 +141,43 @@ class TorchDataGenerator(MFDataGenerator):
                 batch_r.append(r)
                 batch_i.append(i)
 
-            if self.verbose:
-                print("Epoch ", e, "RMSE", np.mean(lsum2), "Proba loss", np.mean(lsum), "Total loss", np.mean(lsum3))
-                lsum, lsum2, lsum3 = [], [], []
+            if loss_components_list:
+                average_metrics = {
+                    component: float(np.mean([x[component] for x in loss_components_list]))
+                    for component in loss_components_list[0]
+                }
 
-    def _build_gmm(self, gmm_clusters):
+                if self.verbose:
+                    print("Epoch ", e, "\t".join("%s: %f" % (k, v) for k, v in average_metrics.items()))
+
+                for component in average_metrics:
+                    task.logger.report_scalar(
+                        "Loss", component, average_metrics[component], e
+                    )
+
+    def _build_gmm(self, task: Task, gmm_clusters):
+        task.logger.report_text("Building GMM")
         self.gmm = GaussianMixture(gmm_clusters, verbose=2, verbose_interval=1)
         self.gmm.fit(self.user_vectors)
 
-    def _build_implicit_mf(self, consider_items):
-        pass
-
-    def build(self, task: Task, epochs=50, components=200, gmm_clusters=10, consider_items=3000,
-              logloss_weight=2.0, lr=5e-3, implicit_logloss=False):
+    def build(self, task: Task, base_dataset: Dataset, epochs=50, components=200, gmm_clusters=10,
+              logloss_weight=2.0, lr=5e-3, batch_size=5000):
         task.set_user_properties(**to_clear_ml_params(locals(), ["task", "self"]))
-        self.consider_items = consider_items
+        self.item_ids = list(range(len(base_dataset.id_to_item)))
+        self.avg_ratings_per_user = base_dataset.n_ratings / base_dataset.n_users
 
-        task.logger.report_text("Training MF")
         if self.user_vectors is None:
-            self._build_mf(components)
-        task.logger.report_text("Building torch model")
-        self._build_torch_model(components)
-        task.logger.report_text("Training torch model")
-        self._train_torch_model(epochs, logloss_weight=logloss_weight, lr=lr, implicit_logloss=implicit_logloss)
-        task.logger.report_text("Building GMM")
-        self._build_gmm(gmm_clusters)
+            self._build_mf(base_dataset, task, components)
+
+        self._build_torch_model(base_dataset, task, components)
+
+        self._train_torch_model(base_dataset, task, epochs, logloss_weight=logloss_weight, lr=lr, batch_size=batch_size)
+
+        self._build_gmm(task, gmm_clusters)
 
     def _sample_users(self, n_users):
-        avg_ratings_per_user = len(self.ratings.indices) / self.n_users
-
         user_vectors, _ = self.gmm.sample(n_users)
-        ratings_per_user = np.random.exponential(avg_ratings_per_user, size=n_users)
+        ratings_per_user = np.random.exponential(self.avg_ratings_per_user, size=n_users)
 
         return user_vectors, ratings_per_user
 
@@ -159,7 +199,39 @@ class TorchDataGenerator(MFDataGenerator):
         sampled_rating = user_vector.dot(self.item_vectors[item])
         return sampled_rating
 
-    def generate(self, task, n_users=None, use_actual_user_vectors=False, use_actual_items=False, implicit_coef=15.0):
+    def generate(self, task, n_users=None, use_actual_user_vectors=False, use_actual_item_choice=False,
+                 implicit_coef=15.0, **kwargs):
         task.set_user_properties(**to_clear_ml_params(locals(), ["task", "self"]))
         self._implicit_coef = implicit_coef
-        return super().generate(task, n_users, use_actual_user_vectors, use_actual_items)
+
+        if n_users is None:
+            n_users = self.user_vectors.shape[0]
+
+        user_vectors, ratings_per_user = self._sample_users(n_users)
+
+        n_items = self.item_vectors.shape[0]
+        rating_matrix = dok_matrix((n_users, n_items))
+
+        batches = max(1, int(n_users / 1000))
+        for batch_n, user_vectors_batch in enumerate(tqdm(np.array_split(user_vectors, batches))):
+            user_index_base = batch_n * 1000
+
+            # Super-efficient batched matrix multiplication that exploits pytorch (=GPU)
+            probas = self.model.user_choice_probas(user_vectors_batch)
+
+            for user_index_offset in range(len(probas)):
+                u = user_index_base + user_index_offset
+
+                ratings_count = int(ratings_per_user[u])
+                ratings_count = min(ratings_count, n_items)
+
+                v = user_vectors[user_index_offset, :]
+
+                sampled_items = self._sample_user_items(probas[user_index_offset, :], ratings_count)
+
+                for i in sampled_items:
+                    rating_matrix[u, i] = self._get_user_rating(v, i)
+                    rating_matrix[u, i] = np.minimum(1.0, np.maximum(rating_matrix[u, i], -1.0))
+        rating_matrix = csc_matrix(rating_matrix)
+        ds = Dataset(rating_matrix=rating_matrix)
+        return ds

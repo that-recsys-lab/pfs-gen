@@ -105,12 +105,9 @@ def run_librec_auto_experiment(task, dataset_path, recommender, params):
 
 
 def main(task, dataset_task_id, recommender, extra):
-    if dataset_task_id in datasets.name_to_class:
-        pass
-
-    gen_task = Task.get_task(task_id=dataset_task_id)
-    dataset_path = gen_task.artifacts["dataset"].get_local_copy()
-    run_librec_auto_experiment(task, dataset_path, recommender, extra)
+    ds = datasets.get_dataset(dataset_task_id)
+    ds.write("temp")
+    run_librec_auto_experiment(task, "temp", recommender, extra)
 
 
 if __name__ == "__main__":

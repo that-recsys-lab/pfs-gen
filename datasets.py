@@ -1,3 +1,5 @@
+from typing import Type
+
 import pandas as pd
 from clearml import Task
 from scipy.sparse import dok_matrix, csc_matrix
@@ -25,12 +27,12 @@ class Dataset:
         self.rating_matrix = None
         self.id_to_user = None
         self.id_to_item = None
+        self.n_ratings = 0
         if rating_matrix is not None:
-            self.rating_matrix = rating_matrix
+            self.rating_matrix = rating_matrix  # type:csc_matrix
             self.id_to_user = {i: str(i) for i in range(self.rating_matrix.shape[0])}
             self.id_to_item = {i: str(i) for i in range(self.rating_matrix.shape[1])}
-            return
-        if rating_df is not None:
+        elif rating_df is not None:
             # Map users/items into a more dense structure, as
             # not all movies have ratings
             user_to_id, id_to_user = to_map(rating_df["userId"].unique())
@@ -47,6 +49,11 @@ class Dataset:
             self.rating_matrix = rating_matrix
             self.id_to_user = id_to_user
             self.id_to_item = id_to_item
+        else:
+            raise Exception("Data, please")
+        self.n_users = len(self.id_to_user)
+        self.n_items = len(self.id_to_item)
+        self.n_ratings = self.rating_matrix.getnnz()
 
     def write(self, filename):
         with open(filename, "w") as f:
@@ -54,8 +61,9 @@ class Dataset:
                 f.write("%d,%d,%d\n" % (k[0], k[1], int(v * 2.5 + 2.5)))
 
     def as_iterator(self):
-        for k, v in self.rating_matrix.items():
-            yield k[0], k[1], v
+        rows, cols = self.rating_matrix.nonzero()
+        for row, col in zip(rows, cols):
+            yield row, col, self.rating_matrix[row, col]
 
     def print_stats(self):
         n_users, n_items = len(self.id_to_user), len(self.id_to_item)
@@ -79,20 +87,14 @@ class Dataset:
         ]
 
     @staticmethod
-    def read(filename):
+    def read(filename, sep=None):
         with open(filename, "r") as f:
             df = []
             for line in f:
-                args = line.split()
+                args = line.split(sep)
                 df.append((args[0], args[1], args[2]))
         df = pd.DataFrame(df, columns=["userId", "movieId", "rating"])
         return Dataset(df)
-
-    @staticmethod
-    def read_clearml_experiment(task_id, artifact_name="dataset"):
-        gen_task = Task.get_task(task_id=task_id)
-        dataset_path = gen_task.artifacts[artifact_name].get_local_copy()
-        return Dataset.read(dataset_path)
 
 
 class Movielens1MDataset(Dataset):
@@ -109,5 +111,20 @@ class AmazonDataset(Dataset):
         super().__init__(ratings)
 
 
-name_to_class = {"ml1m": Movielens1MDataset, "amazon": AmazonDataset}
+__name_to_class = {"ml1m": Movielens1MDataset, "amazon": AmazonDataset}
 
+
+def get_dataset(name_or_task_id) -> Dataset:
+    if name_or_task_id is None:
+        raise Exception()
+    try:
+        gen_task = Task.get_task(task_id=name_or_task_id)
+    except ValueError:
+        gen_task = None
+
+    if name_or_task_id in __name_to_class:
+        return __name_to_class[name_or_task_id]()
+    elif gen_task is not None:
+        dataset_path = gen_task.artifacts["dataset"].get_local_copy()
+        return Dataset.read(dataset_path, sep=",")
+    raise Exception("Unknown dataset " + str(name_or_task_id))
