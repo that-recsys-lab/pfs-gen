@@ -53,7 +53,7 @@ class Dataset:
             raise Exception("Data, please")
         self.n_users = len(self.id_to_user)
         self.n_items = len(self.id_to_item)
-        self.n_ratings = self.rating_matrix.getnnz()
+        self.n_ratings = len(rating_matrix.data)
 
     def write(self, filename):
         with open(filename, "w") as f:
@@ -61,6 +61,7 @@ class Dataset:
                 f.write("%d,%d,%d\n" % (k[0], k[1], int(v * 2.5 + 2.5)))
 
     def as_iterator(self):
+        # Bug here
         rows, cols = self.rating_matrix.nonzero()
         for row, col in zip(rows, cols):
             yield row, col, self.rating_matrix[row, col]

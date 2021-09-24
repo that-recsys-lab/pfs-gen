@@ -1,4 +1,4 @@
-from random import shuffle
+from random import shuffle, randint
 from typing import Type
 
 from clearml import Task
@@ -13,6 +13,29 @@ from datasets import Dataset
 from tools import to_clear_ml_params
 from .interface import SyntheticDataGenerator
 import torch.nn
+
+
+def quick_choice(lower, upper, n):
+    d = set()
+    for _ in range(n):
+        candidate = randint(lower, upper)
+        while True:
+            if candidate in d:
+                candidate += 1
+                if candidate >= upper:
+                    candidate = lower
+            else:
+                break
+        d.add(candidate)
+    return list(d)
+
+
+def quick_choice_from(xs, n):
+    return np.random.choice(xs, n)
+    l = quick_choice(0, len(xs), n)
+    for i in range(len(l)):
+        l[i] = xs[l[i]]
+    return l
 
 
 class MatrixFactorization(torch.nn.Module):
@@ -71,7 +94,8 @@ class Sampletext(SyntheticDataGenerator):
 
     def _train_torch_model(self, ds: Dataset, task: Task, epochs, logloss_weight, lr,
                            batch_user_size=200,
-                           samples_per_user=400,
+                           positive_samples_per_user=100,
+                           negative_samples_per_user=300,
                            logloss_only_lr=1e-1,
                            epochs_logloss_only=30):
         task.logger.report_text("Training torch model")
@@ -98,6 +122,7 @@ class Sampletext(SyntheticDataGenerator):
                 probas_raw = probas.detach().numpy()
                 probas = torch.sigmoid(probas)
 
+                samples_per_user = positive_samples_per_user + negative_samples_per_user
                 sampled_items_labels = [0] * len(batch_user_ids) * samples_per_user
                 sampled_items_probas = FloatTensor([0] * len(batch_user_ids) * samples_per_user)
 
@@ -105,22 +130,37 @@ class Sampletext(SyntheticDataGenerator):
                 rated_item_itemid = []
                 rated_item_rating = []
 
+                position = 0
                 for user_index_offset in range(len(batch_user_ids)):
-                    u = user_index_offset * samples_per_user
-                    sampled_items = self._sample_user_items(probas_raw[user_index_offset, :], samples_per_user)
+                    # * 2 because otherwise we cannot guarantee that we will get enough negatives from that sample
+                    sampled_negative_items = self._sample_user_items(probas_raw[user_index_offset, :], samples_per_user * 2)
 
-                    sampled_items_probas[u: u + samples_per_user] = probas[user_index_offset, sampled_items]
-                    for idx, i in enumerate(sampled_items):
-                        if i in self.user_map[batch_user_ids[user_index_offset]]:
-                            sampled_items_labels[u + idx] = 1
-                            rated_item_userid.append(batch_user_ids[user_index_offset])
-                            rated_item_itemid.append(i)
-                            rated_item_rating.append(self.user_map[batch_user_ids[user_index_offset]][i])
+                    negatives = 0
+                    for idx, i in enumerate(sampled_negative_items):
+                        if i not in self.user_map[batch_user_ids[user_index_offset]]:
+                            sampled_items_probas[position] = probas[user_index_offset, i]
+                            negatives += 1
+                            position += 1
+                            if negatives == negative_samples_per_user:
+                                break
+                        else:
                             hits += 1
+
+                    sampled_positives = quick_choice_from(self.user_map_list[batch_user_ids[user_index_offset]], positive_samples_per_user)
+
+                    sampled_items_probas[position:position + len(sampled_positives)] = probas[user_index_offset, sampled_positives]
+                    for idx, i in enumerate(sampled_positives):
+                        sampled_items_labels[position + idx] = 1
+
+                        rated_item_userid.append(batch_user_ids[user_index_offset])
+                        rated_item_itemid.append(i)
+                        rated_item_rating.append(self.user_map[batch_user_ids[user_index_offset]][i])
+                    position += len(sampled_positives)
+
                 optimizer.zero_grad()
 
                 sampled_items_labels = FloatTensor(sampled_items_labels)
-                loss_crossentropy = self.crossentropy(sampled_items_probas, sampled_items_labels)
+                loss_crossentropy = self.crossentropy(sampled_items_probas[:position], sampled_items_labels[:position])
 
                 loss_components = {
                     "hits": hits,
@@ -178,6 +218,7 @@ class Sampletext(SyntheticDataGenerator):
             if u not in self.user_map:
                 self.user_map[u] = {}
             self.user_map[u][i] = r - self.avg_rating
+        self.user_map_list = {k: list(v.keys()) for k, v in self.user_map.items()}
 
         self.user_ids = list(set(self.user_ids))
         self.item_ids = list(range(len(base_dataset.id_to_item)))
@@ -198,16 +239,19 @@ class Sampletext(SyntheticDataGenerator):
 
         return user_vectors, ratings_per_user
 
+    def _logit_to_probas(self, dotproducts):
+        dotproducts = dotproducts * self._implicit_coef
+        logits = 1.0 / (1e-7 + np.exp(-dotproducts))
+        return logits
+
     def _sample_user_items(self, dotproducts, n_items):
         # MAGIC HERE
         # We transform arbitrary scores trained with RMSE loss
         # into probabilities
         # we can do this in a bunch of ways
         # hence, sigmoid and * 10 here
-        dotproducts = dotproducts * self._implicit_coef
-        logits = 1.0 / (1e-7 + np.exp(-dotproducts))
+        logits = self._logit_to_probas(dotproducts)
         logits = logits / np.sum(logits)
-
         sampled_items = np.random.choice(self.item_ids, n_items, False, p=logits)
 
         return sampled_items

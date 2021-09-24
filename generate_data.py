@@ -36,17 +36,27 @@ def log_difference(task: Task, ds, ds_original):
     task.logger.report_scalar("rating mean t-test", "", ttest.pvalue, 0)
     task.logger.report_scalar("rating mean t-test stat", "", ttest.statistic, 0)
 
+    f = plt.figure()
+    plt.hist(list(ds.rating_matrix.data), label="synthetic", figure=f)
+    plt.hist(list(ds.ds_original.data), label="original", figure=f)
+    log_it(task, "Rating distributions", "rating distribution", f, "")
+
+
+def load_generator(task_id):
+    gen_task = Task.get_task(task_id=task_id)
+    generator_path = gen_task.artifacts["generator"].get_local_copy()
+    with open(generator_path, "rb") as f:
+        generator_obj = pickle.load(f)  # type: SyntheticDataGenerator
+    return generator_obj
+
 
 def main(task, generator_task_id, extra):
-    gen_task = Task.get_task(task_id=generator_task_id)
-    generator_path = gen_task.artifacts["generator"].get_local_copy()
     original_ds_name = gen_task._hyper_params_manager.get_hyper_params(
         sections=['Args'], projector=None
     )['Args']['dataset']['value']
     original_ds = get_dataset(original_ds_name)
 
-    with open(generator_path, "rb") as f:
-        generator_obj = pickle.load(f)  # type: SyntheticDataGenerator
+    generator_obj = load_generator(generator_task_id)
     generated = generator_obj.generate(task, **extra)
 
     with open('dataset.csv', "w") as f:
