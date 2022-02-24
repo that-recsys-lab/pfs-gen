@@ -1,10 +1,10 @@
-from typing import Type
-
+import inspect
+import typing
+from typing import Type, Iterable, TypeVar, Generic, Callable, Iterator, Dict, List
 import pandas as pd
 from clearml import Task
 from scipy.sparse import dok_matrix, csc_matrix
 import numpy as np
-
 import matplotlib.pyplot as plt
 
 
@@ -23,13 +23,13 @@ def to_map(xs):
 
 
 class Dataset:
-    def __init__(self, rating_df=None, rating_matrix=None):
-        self.rating_matrix = None
+    def __init__(self, rating_df=None, rating_matrix=None, rescale=True):
+        self.rating_matrix = None  # type:csc_matrix
         self.id_to_user = None
         self.id_to_item = None
         self.n_ratings = 0
         if rating_matrix is not None:
-            self.rating_matrix = rating_matrix  # type:csc_matrix
+            self.rating_matrix = rating_matrix
             self.id_to_user = {i: str(i) for i in range(self.rating_matrix.shape[0])}
             self.id_to_item = {i: str(i) for i in range(self.rating_matrix.shape[1])}
         elif rating_df is not None:
@@ -44,7 +44,9 @@ class Dataset:
 
             # That's the only sane way to preserve explicit zeroes
             rating_matrix = csc_matrix(rating_matrix)
-            rating_matrix.data = rating_matrix.data / 2.5 - 1.0
+            self.rescale = rescale
+            if rescale:
+                rating_matrix.data = rating_matrix.data / 2.5 - 1.0
 
             self.rating_matrix = rating_matrix
             self.id_to_user = id_to_user
@@ -58,10 +60,10 @@ class Dataset:
     def write(self, filename):
         with open(filename, "w") as f:
             for k, v in self.rating_matrix.items():
-                f.write("%d,%d,%d\n" % (k[0], k[1], int(v * 2.5 + 2.5)))
+                rating = int(v * 2.5 + 2.5) if self.rescale else v
+                f.write("%d,%d,%d\n" % (k[0], k[1], rating))
 
     def as_iterator(self):
-        # Bug here
         rows, cols = self.rating_matrix.nonzero()
         for row, col in zip(rows, cols):
             yield row, col, self.rating_matrix[row, col]
@@ -99,17 +101,17 @@ class Dataset:
 
 
 class Movielens1MDataset(Dataset):
-    def __init__(self):
-        ratings = pd.read_csv("datasets/ml-1m-ratings.dat", sep="::")
+    def __init__(self, path="datasets/ml-1m-ratings.dat", sep="::", rescale=True):
+        ratings = pd.read_csv(path, sep=sep)
         ratings.columns = ["userId", "movieId", "rating", "timestamp"]
-        super().__init__(ratings)
+        super().__init__(ratings, rescale=rescale)
 
 
 class AmazonDataset(Dataset):
-    def __init__(self):
-        ratings = pd.read_csv("datasets/ratings_Pet_Supplies.csv", header=None)
+    def __init__(self, path="datasets/ratings_Pet_Supplies.csv", rescale=True):
+        ratings = pd.read_csv(path, header=None)
         ratings.columns = ["userId", "movieId", "rating", "timestamp"]
-        super().__init__(ratings)
+        super().__init__(ratings, rescale=rescale)
 
 
 __name_to_class = {"ml1m": Movielens1MDataset, "amazon": AmazonDataset}
@@ -129,3 +131,83 @@ def get_dataset(name_or_task_id) -> Dataset:
         dataset_path = gen_task.artifacts["dataset"].get_local_copy()
         return Dataset.read(dataset_path, sep=",")
     raise Exception("Unknown dataset " + str(name_or_task_id))
+
+
+T = TypeVar("T")
+
+
+class CursorHandle(Generic[T]):
+    def _generate_getter(self, field):
+        def f():
+            v = self._prop_fields.get(field)
+            if v is None:
+                return self._current.get(v)
+            elif callable(v):
+                return v(self._current)
+            else:
+                return self._current.get(v)
+        return f
+
+    def _generate_props(self, props):
+        for prop, getter in props:
+            self._prop_fields[prop] = getter
+            prop_getter = self._generate_getter(prop)
+            prop_getter.__doc__ = f"Property {prop}"
+            setattr(self, f"get_{prop}", prop_getter)
+
+    def __init__(self, over_what: Iterator[T], length: int,
+                 props_list: List[str] = None,
+                 props_dict: Dict[str, Callable or str or int] = None):
+        if props_list is None and props_dict is None:
+            assert "supply props_list or props_dict!"
+        self.idx = -1
+        self._collection = over_what
+        self._length = length
+        self._current = None
+        self._prop_fields = {}
+        self._props = props_dict.items() if props_dict else zip(props_list, [None] * len(props_list))
+        self._generate_props(self._props)
+
+    def __repr__(self):
+        flds = [f"{k}:{repr(getattr(self, 'get_' + k)())}" for k in self._prop_fields.keys()]
+        return (f"Cursor {hex(id(self))} current entry #{self.idx}: <" + ">, <".join([
+            x[:50]+"..." if len(x) > 50 else x
+            for x in flds]) +
+                ">")
+
+    def reset(self):
+        self.idx = -1
+        return self
+
+    def __iter__(self):
+        return self.reset()
+
+    def __next__(self):
+        self.idx += 1
+        if self.idx > self._length:
+            raise StopIteration()
+        self._current = next(self._collection)
+        return self
+
+    def __len__(self):
+        return self._length
+
+    @property
+    def is_valid(self) -> bool:
+        return (0 <= self.idx) and ((self._length is None) or (self.idx < self._length))
+
+    @property
+    def is_first(self) -> bool:
+        return self.idx == 0
+
+    @property
+    def is_last(self) -> bool:
+        return (self._length is not None) and (self.idx == self._length - 1)
+
+
+def ratings_batches(ds: Dataset, batch_size: int = 256):
+    valid_indices = np.array(ds.rating_matrix.nonzero()).transpose()
+    np.random.shuffle(valid_indices)
+    batches = np.array_split(ds.n_ratings // batch_size)
+    for batch in batches:
+        yield ds.rating_matrix[batch[0], batch[1]]

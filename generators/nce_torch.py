@@ -103,3 +103,7 @@ class NCESamplerGenerator(TorchDataGenerator):
                 "total": loss.item(),
             }
         return loss, loss_components
+
+Heatmap for item co-occurence map
+Content information
+
